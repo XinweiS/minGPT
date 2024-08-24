@@ -36,8 +36,10 @@ class CausalSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd)
+        # key, query, value projections for all heads
+        self.c_key = nn.Linear(config.n_embd, config.n_embd)
+        self.c_query = nn.Linear(config.n_embd, config.n_embd)
+        self.c_value = nn.Linear(config.n_embd, config.n_embd)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd)
         # regularization
@@ -49,11 +51,27 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
-    def forward(self, x):
+    def forward(self, x, kv_cache=None):
+        # kv_cache
+        # k, v: [batch, T-1, C]
+        
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
+        q = self.c_query(x)
+        new_cache = None
+        if kv_cache is not None:
+            k_cache, v_cache = kv_cache
+            k_last = self.c_key(x[:, -1, :]).view(B, 1, C)
+            v_last = self.c_value(x[:, -1, :]).view(B, 1, C)
+            k = torch.cat((k_cache, k_last), dim=1)
+            v = torch.cat((v_cache, v_last), dim=1)
+            new_cache = (k, v)
+        else:
+            k = self.c_key(x)
+            v = self.c_value(x)
+            
+        # q, k ,v  = self.c_attn(x).split(self.n_embd, dim=2)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
@@ -68,7 +86,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, new_cache
 
 class Block(nn.Module):
     """ an unassuming Transformer block """
@@ -87,10 +105,11 @@ class Block(nn.Module):
         m = self.mlp
         self.mlpf = lambda x: m.dropout(m.c_proj(m.act(m.c_fc(x)))) # MLP forward
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, kv_cache=None):
+        atten_out, new_kv_cache = self.attn(self.ln_1(x), kv_cache=kv_cache)
+        x = x + atten_out
         x = x + self.mlpf(self.ln_2(x))
-        return x
+        return x, new_kv_cache
 
 class GPT(nn.Module):
     """ GPT Language Model """
@@ -140,7 +159,7 @@ class GPT(nn.Module):
                 'gpt-micro':    dict(n_layer=4, n_head=4, n_embd=128),
                 'gpt-nano':     dict(n_layer=3, n_head=3, n_embd=48),
             }[config.model_type])
-
+        self.config = config
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
             wpe = nn.Embedding(config.block_size, config.n_embd),
@@ -159,6 +178,7 @@ class GPT(nn.Module):
         # report number of parameters (note we don't count the decoder parameters in lm_head)
         n_params = sum(p.numel() for p in self.transformer.parameters())
         print("number of parameters: %.2fM" % (n_params/1e6,))
+
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -257,7 +277,9 @@ class GPT(nn.Module):
         optimizer = torch.optim.AdamW(optim_groups, lr=train_config.learning_rate, betas=train_config.betas)
         return optimizer
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, kv_cache_list=None):
+        # kv_cache_list: same length as self.transformer.h, and each elementt is kv_cache tuple for that layer
+        
         device = idx.device
         b, t = idx.size()
         assert t <= self.block_size, f"Cannot forward sequence of length {t}, block size is only {self.block_size}"
@@ -267,8 +289,15 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+        if kv_cache_list is not None:
+            new_kv_cache_list = []
+            for block, kv_cache in zip(self.transformer.h, kv_cache_list):
+                x, new_cache = block(x, kv_cache=kv_cache)
+                new_kv_cache_list.append(new_cache)
+        else:
+            new_kv_cache_list = None
+            for block in self.transformer.h:
+                x, _ = block(x)
         x = self.transformer.ln_f(x)
         logits = self.lm_head(x)
 
@@ -277,7 +306,7 @@ class GPT(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
-        return logits, loss
+        return logits, loss, new_kv_cache_list
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, do_sample=False, top_k=None):
@@ -286,11 +315,13 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
+        kv_cache_list = [(torch.zeros(1, 0, self.config.n_emb), torch.zeros(1, 0, self.config.n_emb)) for _ in range(self.confg.n_layer)]
         for _ in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
+            # this is incompatible with kv_cache?
             idx_cond = idx if idx.size(1) <= self.block_size else idx[:, -self.block_size:]
             # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+            logits, _, kv_cache_list = self(idx_cond, kv_cache_list)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
